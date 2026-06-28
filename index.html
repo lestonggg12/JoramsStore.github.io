@@ -624,16 +624,16 @@
                         ? '<strong>✅ App Storage</strong> is available on this device — no permissions needed, ever.'
                         : '<strong>📂 Device Folder</strong> lets you choose where to save your data.'}
                 </div>
-                ${opfsSupported && !isDesktop ? `
-                <button class="sm-btn-primary" id="btnEnableOPFS">
-                    ✅ Enable App Storage (Recommended)
-                </button>
-                ` : ''}
-                ${isDesktop || !opfsSupported ? `
-                <button class="sm-btn-primary" id="btnChooseFolder">
-                    📂 Choose Storage Folder
-                </button>
-                ` : ''}
+                ${opfsSupported ? `
+<button class="sm-btn-primary" id="btnEnableOPFS">
+    ✅ Enable App Storage (Recommended)
+</button>
+` : ''}
+${isDesktop ? `
+<button class="sm-btn-secondary" id="btnChooseFolder" style="display:block;margin:8px auto 12px;color:#5a7a5e;font-size:12px;text-decoration:underline;cursor:pointer;border:none;background:none;">
+    Or choose a device folder instead (desktop only)
+</button>
+` : ''}
                 ${opfsSupported && !isDesktop ? `
                 <button class="sm-btn-secondary" id="btnChooseFolderInstead" style="display:block;margin:8px auto 12px;color:#5a7a5e;font-size:12px;text-decoration:underline;cursor:pointer;border:none;background:none;">
                     Or choose a folder instead

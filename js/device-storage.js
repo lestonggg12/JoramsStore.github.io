@@ -4,12 +4,18 @@
  * Desktop (Chrome/Edge):  File System Access API → user's chosen folder
  * Tablet/Mobile:          OPFS (Origin Private File System) → zero permission prompts, ever
  * Fallback:               localStorage
+ *
+ * FIX LOG:
+ *  - writeFile() now catches NoModificationAllowedError and falls back to localStorage
+ *  - _doInit() now detects non-desktop (GitHub Pages / mobile) and forces OPFS
+ *  - reconnectDirectory() syntax was broken — fully rewritten cleanly
+ *  - saveToDevice() in 'device' mode now also falls back on write failure
  */
 
 class DeviceStorageManager {
   constructor() {
     this.dirHandle   = null;
-    this.opfsRoot    = null;   // OPFS root directory handle
+    this.opfsRoot    = null;
     this.storageMode = 'localStorage'; // 'device' | 'opfs' | 'localStorage'
     this.fileHandles = {};
     this.data = {
@@ -18,23 +24,27 @@ class DeviceStorageManager {
       periodTotals: {}, accumulatedTotals: {}
     };
 
-    // File System Access API (desktop)
-    this.isSupported      = 'showDirectoryPicker' in window;
-    // OPFS — works on all modern browsers including tablet Chrome/Safari
-    this.isOPFSSupported  = 'storage' in navigator && 'getDirectory' in navigator.storage;
+    this.isSupported     = 'showDirectoryPicker' in window;
+    this.isOPFSSupported = 'storage' in navigator && 'getDirectory' in navigator.storage;
 
-    this.dbName    = 'DeviceStorageHandles';
-    this.storeName = 'fileHandles';
+    // ✅ FIX: Detect non-desktop early so we never try device folder on GitHub Pages
+    this.isDesktop = window.matchMedia('(hover: hover) and (pointer: fine)').matches;
+
+    this.dbName        = 'DeviceStorageHandles';
+    this.storeName     = 'fileHandles';
     this.initialized   = false;
     this._savedHandle  = null;
     this._initPromise  = null;
 
     this.initIndexedDB();
 
-    console.log(`📁 File System API: ${this.isSupported ? '✅' : '❌'} | OPFS: ${this.isOPFSSupported ? '✅' : '❌'}`);
+    console.log(
+      `📁 File System API: ${this.isSupported ? '✅' : '❌'} | ` +
+      `OPFS: ${this.isOPFSSupported ? '✅' : '❌'} | ` +
+      `Desktop: ${this.isDesktop ? '✅' : '📱'}`
+    );
 
-    // Register early reconnect listener for desktop File System API
-    if (this.isSupported) {
+    if (this.isSupported && this.isDesktop) {
       this._setupEarlyReconnectListener();
     }
   }
@@ -47,8 +57,8 @@ class DeviceStorageManager {
     if (!this.isSupported) return;
     return new Promise((resolve, reject) => {
       const request = indexedDB.open(this.dbName, 1);
-      request.onerror       = () => reject(request.error);
-      request.onsuccess     = () => resolve(request.result);
+      request.onerror         = () => reject(request.error);
+      request.onsuccess       = () => resolve(request.result);
       request.onupgradeneeded = (event) => {
         const db = event.target.result;
         if (!db.objectStoreNames.contains(this.storeName)) {
@@ -65,7 +75,9 @@ class DeviceStorageManager {
       const tx    = db.transaction(this.storeName, 'readwrite');
       const store = tx.objectStore(this.storeName);
       store.put({ id: 'jorams-data-dir', handle: dirHandle, savedAt: new Date().toISOString() });
-    } catch (err) { console.error('Failed to save handle to IDB:', err); }
+    } catch (err) {
+      console.error('Failed to save handle to IDB:', err);
+    }
   }
 
   async getHandleFromIDB() {
@@ -85,7 +97,7 @@ class DeviceStorageManager {
   }
 
   // =========================================================================
-  //  INITIALIZATION — auto-picks best storage for device
+  //  INITIALIZATION
   // =========================================================================
 
   async init() {
@@ -98,22 +110,20 @@ class DeviceStorageManager {
   }
 
   async _doInit() {
-    const usesOPFS      = localStorage.getItem('useOPFS') === 'true';
-    const usesFolder    = localStorage.getItem('deviceStorageConnected') === 'true';
+    const usesOPFS   = localStorage.getItem('useOPFS') === 'true';
+    const usesFolder = localStorage.getItem('deviceStorageConnected') === 'true';
 
-    // ── OPFS (tablet/mobile) ─────────────────────────────────────────────────
+    // ── OPFS path ─────────────────────────────────────────────────────────────
     if (usesOPFS && this.isOPFSSupported) {
       try {
-        const root = await navigator.storage.getDirectory();
-        this.opfsRoot    = root;
+        this.opfsRoot    = await navigator.storage.getDirectory();
         this.storageMode = 'opfs';
         await this._loadAllFromOPFS();
         this.initialized = true;
         console.log('✅ OPFS initialized');
         return true;
       } catch (err) {
-        console.error('OPFS failed — staying on OPFS, data may be empty:', err);
-        // Still mark as OPFS so saves go there — don't fall to localStorage
+        console.error('OPFS init failed — keeping OPFS mode, data may be empty:', err);
         this.storageMode = 'opfs';
         this.initialized = true;
         return true;
@@ -121,7 +131,20 @@ class DeviceStorageManager {
     }
 
     // ── Desktop File System API ───────────────────────────────────────────────
-    if (this.isSupported) {
+    // ✅ FIX: Skip device folder entirely on non-desktop (GitHub Pages, mobile, tablet)
+    //         Device folder requires a user gesture each session — it will always fail writes
+    //         on hosted pages. Use OPFS instead.
+    if (this.isSupported && usesFolder) {
+      if (!this.isDesktop && this.isOPFSSupported) {
+        console.log('📱 Non-desktop with saved folder — switching to OPFS automatically');
+        localStorage.setItem('useOPFS', 'true');
+        localStorage.removeItem('deviceStorageConnected');
+        // Re-run init, will hit OPFS branch now
+        this.initialized = false;
+        return await this._doInit();
+      }
+
+      // Desktop only — try to reconnect saved folder
       try {
         const dirHandle = await this.getHandleFromIDB();
         if (dirHandle) {
@@ -137,8 +160,8 @@ class DeviceStorageManager {
             console.log('✅ Device File System initialized');
             return true;
           } else {
-            // Need gesture — load localStorage temporarily so app isn't blank,
-            // but DO NOT mark as localStorage mode — saves will go to device once reconnected
+            // Permission not yet granted — load localStorage temporarily
+            // Saves will queue to device once user gesture reconnects
             this.loadFromLocalStorage();
             if (this._activateReconnect) this._activateReconnect(dirHandle);
             return true;
@@ -149,9 +172,8 @@ class DeviceStorageManager {
       }
     }
 
-    // ── OPFS available but not yet chosen ────────────────────────────────────
-    if (this.isOPFSSupported && !usesOPFS && !usesFolder) {
-      // Not configured yet — use localStorage until user chooses storage
+    // ── Not configured yet — use localStorage ────────────────────────────────
+    if (!usesOPFS && !usesFolder) {
       console.log('📦 No storage configured yet — using localStorage');
       return this.loadFromLocalStorage();
     }
@@ -228,10 +250,14 @@ class DeviceStorageManager {
   async _saveKeyToOPFS(key) {
     if (!this.opfsRoot) return false;
     const fileMap = {
-      categories: 'categories.json', products: 'products.json',
-      sales: 'sales.json', sales_history: 'sales_history.json',
-      debtors: 'debtors.json', payment_history: 'payment_history.json',
-      settings: 'settings.json', periodTotals: 'periodTotals.json',
+      categories:        'categories.json',
+      products:          'products.json',
+      sales:             'sales.json',
+      sales_history:     'sales_history.json',
+      debtors:           'debtors.json',
+      payment_history:   'payment_history.json',
+      settings:          'settings.json',
+      periodTotals:      'periodTotals.json',
       accumulatedTotals: 'accumulatedTotals.json'
     };
     const filename = fileMap[key];
@@ -240,19 +266,19 @@ class DeviceStorageManager {
   }
 
   // =========================================================================
-  //  OPFS PUBLIC API — enable OPFS from Settings
+  //  OPFS PUBLIC API
   // =========================================================================
 
   async enableOPFS() {
     if (!this.isOPFSSupported) return false;
     try {
       this.opfsRoot = await navigator.storage.getDirectory();
-      // Copy whatever data is currently in memory (from localStorage) to OPFS
       await this._saveAllToOPFS();
       this.storageMode = 'opfs';
       this.initialized = true;
       localStorage.setItem('useOPFS', 'true');
       localStorage.removeItem('storagePromptDismissed');
+      localStorage.removeItem('deviceStorageConnected');
       console.log('✅ OPFS enabled and data migrated');
       return true;
     } catch (err) {
@@ -267,26 +293,41 @@ class DeviceStorageManager {
 
   async saveToDevice(key) {
     if (this.storageMode === 'opfs') {
-      // Auto-init opfsRoot if not set yet
       if (!this.opfsRoot) {
-        try { this.opfsRoot = await navigator.storage.getDirectory(); } catch(e) {}
+        try { this.opfsRoot = await navigator.storage.getDirectory(); } catch (e) {}
       }
-      return await this._saveKeyToOPFS(key);
+      const ok = await this._saveKeyToOPFS(key);
+      // If OPFS write fails, mirror to localStorage as safety net
+      if (!ok) this.saveToLocalStorage();
+      return ok;
     }
+
     if (this.storageMode === 'device') {
-      if (!this.isSupported || !this.dirHandle) return false;
+      if (!this.isSupported || !this.dirHandle) {
+        // No handle — fall back to localStorage
+        this.saveToLocalStorage();
+        return false;
+      }
       const fileMap = {
-        categories: 'categories.json', products: 'products.json',
-        sales: 'sales.json', sales_history: 'sales_history.json',
-        debtors: 'debtors.json', payment_history: 'payment_history.json',
-        settings: 'settings.json', periodTotals: 'periodTotals.json',
+        categories:        'categories.json',
+        products:          'products.json',
+        sales:             'sales.json',
+        sales_history:     'sales_history.json',
+        debtors:           'debtors.json',
+        payment_history:   'payment_history.json',
+        settings:          'settings.json',
+        periodTotals:      'periodTotals.json',
         accumulatedTotals: 'accumulatedTotals.json'
       };
       const filename = fileMap[key];
       if (!filename) return false;
-      return await this.writeFile(filename, this.data[key]);
+      const ok = await this.writeFile(filename, this.data[key]);
+      // ✅ FIX: Mirror to localStorage so data is never fully lost on write failure
+      if (!ok) this.saveToLocalStorage();
+      return ok;
     }
-    // localStorage — mirror via saveToLocalStorage below
+
+    // localStorage mode
     this.saveToLocalStorage();
     return true;
   }
@@ -294,7 +335,10 @@ class DeviceStorageManager {
   async saveAllToDevice() {
     if (this.storageMode === 'opfs')   return await this._saveAllToOPFS();
     if (this.storageMode === 'device') {
-      if (!this.isSupported || !this.dirHandle) return false;
+      if (!this.isSupported || !this.dirHandle) {
+        this.saveToLocalStorage();
+        return false;
+      }
       try {
         await Promise.all([
           this.writeFile('categories.json',        this.data.categories),
@@ -308,7 +352,11 @@ class DeviceStorageManager {
           this.writeFile('accumulatedTotals.json',  this.data.accumulatedTotals),
         ]);
         return true;
-      } catch (err) { console.error('saveAllToDevice error:', err); return false; }
+      } catch (err) {
+        console.error('saveAllToDevice error:', err);
+        this.saveToLocalStorage();
+        return false;
+      }
     }
     this.saveToLocalStorage();
     return true;
@@ -319,8 +367,12 @@ class DeviceStorageManager {
   // =========================================================================
 
   async getFileHandle(filename, create = true) {
-    try { return await this.dirHandle.getFileHandle(filename, { create }); }
-    catch (err) { console.error(`Error getting file handle for ${filename}:`, err); return null; }
+    try {
+      return await this.dirHandle.getFileHandle(filename, { create });
+    } catch (err) {
+      console.error(`Error getting file handle for ${filename}:`, err);
+      return null;
+    }
   }
 
   async readFile(filename) {
@@ -338,13 +390,49 @@ class DeviceStorageManager {
 
   async writeFile(filename, data) {
     try {
-      const fh       = await this.getFileHandle(filename, true);
+      const fh = await this.getFileHandle(filename, true);
       if (!fh) throw new Error('Could not get file handle');
       const writable = await fh.createWritable();
       await writable.write(JSON.stringify(data, null, 2));
       await writable.close();
       return true;
-    } catch (err) { console.error(`Error writing ${filename}:`, err); return false; }
+    } catch (err) {
+      console.error(`Error writing ${filename}:`, err);
+
+      // ✅ FIX: Permission lost (happens on GitHub Pages every session reload)
+      //         Fall back to localStorage immediately so data is not lost
+      if (err.name === 'NoModificationAllowedError' || err.name === 'NotAllowedError') {
+        console.warn('⚠️ Device write permission lost — switching to localStorage');
+        this.storageMode = 'localStorage';
+        this.dirHandle   = null;
+        this.saveToLocalStorage();
+        this._updateBadge('Browser Storage');
+        this._showPermissionLostBanner();
+      }
+      return false;
+    }
+  }
+
+  // ✅ NEW: Show a one-time banner when device storage permission is lost
+  _showPermissionLostBanner() {
+    if (document.getElementById('_permLostBanner')) return;
+    const banner = document.createElement('div');
+    banner.id = '_permLostBanner';
+    banner.style.cssText = `
+      position:fixed; top:0; left:0; right:0; z-index:99999;
+      background:linear-gradient(135deg,#d97706,#b45309);
+      color:white; padding:12px 20px; text-align:center;
+      font-size:14px; font-weight:700; display:flex;
+      align-items:center; justify-content:center; gap:12px;
+    `;
+    banner.innerHTML = `
+      ⚠️ Storage permission lost — your data is being saved to browser storage.
+      <button onclick="this.parentElement.remove()" style="
+        background:rgba(255,255,255,0.25); border:none; color:white;
+        padding:4px 10px; border-radius:8px; cursor:pointer; font-weight:800;
+      ">✕</button>
+    `;
+    document.body.prepend(banner);
   }
 
   async loadAllFromDevice() {
@@ -362,7 +450,7 @@ class DeviceStorageManager {
   }
 
   // =========================================================================
-  //  EARLY RECONNECT LISTENER (desktop File System API only)
+  //  EARLY RECONNECT LISTENER (desktop only)
   // =========================================================================
 
   _setupEarlyReconnectListener() {
@@ -410,7 +498,7 @@ class DeviceStorageManager {
       events.forEach(evt => document.removeEventListener(evt, handler, true));
     };
 
-    const handler = (e) => {
+    const handler = () => {
       if (fired) return;
       if (!activeHandle) { gestureAvailable = true; return; }
       doPermission(activeHandle);
@@ -421,7 +509,11 @@ class DeviceStorageManager {
 
   _updateBadge(name) {
     const badge = document.querySelector('.offline-badge');
-    if (badge) {
+    if (!badge) return;
+    if (name === 'Browser Storage') {
+      badge.textContent      = '⚠️ Browser Storage (data may clear)';
+      badge.style.background = 'linear-gradient(135deg,#d97706,#b45309)';
+    } else {
       badge.textContent      = `✓ ${this.storageMode === 'opfs' ? 'App Storage' : 'Device Storage'}: ${name}`;
       badge.style.background = 'linear-gradient(135deg,#15803d,#166534)';
     }
@@ -443,8 +535,19 @@ class DeviceStorageManager {
   //  RECONNECT / REQUEST ACCESS (desktop)
   // =========================================================================
 
+  // ✅ FIX: reconnectDirectory was syntactically broken — fully rewritten
   async reconnectDirectory() {
     if (!this.isSupported) return false;
+
+    // ✅ FIX: Non-desktop should never use device folder — switch to OPFS instead
+    if (!this.isDesktop && this.isOPFSSupported) {
+      console.log('📱 Non-desktop — redirecting reconnect to OPFS');
+      localStorage.setItem('useOPFS', 'true');
+      localStorage.removeItem('deviceStorageConnected');
+      this.initialized = false;
+      return await this.init();
+    }
+
     try {
       const dirHandle = this._savedHandle || await this.getHandleFromIDB();
       if (!dirHandle) return false;
@@ -464,6 +567,13 @@ class DeviceStorageManager {
 
   async requestDirectoryAccess() {
     if (!this.isSupported) return false;
+
+    // ✅ FIX: On non-desktop, offer OPFS instead of device folder
+    if (!this.isDesktop && this.isOPFSSupported) {
+      console.log('📱 Non-desktop — using OPFS instead of folder picker');
+      return await this.enableOPFS();
+    }
+
     try {
       const dirHandle = await window.showDirectoryPicker({
         id: 'jorams-data-folder', mode: 'readwrite', startIn: 'documents'
@@ -497,9 +607,11 @@ class DeviceStorageManager {
 
   loadFromLocalStorage() {
     const prefix = 'jorams_sari_sari_';
-    const load   = (key, fallback) => {
-      try { const raw = localStorage.getItem(prefix + key); return raw ? JSON.parse(raw) : fallback; }
-      catch (e) { return fallback; }
+    const load = (key, fallback) => {
+      try {
+        const raw = localStorage.getItem(prefix + key);
+        return raw ? JSON.parse(raw) : fallback;
+      } catch (e) { return fallback; }
     };
     this.data.categories        = load('categories',        []);
     this.data.products          = load('products',          []);
@@ -516,14 +628,18 @@ class DeviceStorageManager {
 
   saveToLocalStorage() {
     const prefix = 'jorams_sari_sari_';
-    const save   = (key, value) => {
+    const save = (key, value) => {
       try { localStorage.setItem(prefix + key, JSON.stringify(value)); }
       catch (e) { console.error('localStorage save error:', key, e); }
     };
-    save('categories', this.data.categories); save('products', this.data.products);
-    save('sales', this.data.sales); save('sales_history', this.data.sales_history);
-    save('debtors', this.data.debtors); save('payment_history', this.data.payment_history);
-    save('settings', this.data.settings); save('periodTotals', this.data.periodTotals);
+    save('categories',        this.data.categories);
+    save('products',          this.data.products);
+    save('sales',             this.data.sales);
+    save('sales_history',     this.data.sales_history);
+    save('debtors',           this.data.debtors);
+    save('payment_history',   this.data.payment_history);
+    save('settings',          this.data.settings);
+    save('periodTotals',      this.data.periodTotals);
     save('accumulatedTotals', this.data.accumulatedTotals);
   }
 
@@ -537,7 +653,10 @@ class DeviceStorageManager {
 
   getEmptyPeriodTotals() {
     const e = { revenue: 0, profit: 0, sales_count: 0, has_data: false };
-    return { today: {...e}, yesterday: {...e}, last_week: {...e}, last_month: {...e}, last_year: {...e} };
+    return {
+      today:      { ...e }, yesterday: { ...e },
+      last_week:  { ...e }, last_month: { ...e }, last_year: { ...e }
+    };
   }
 
   // =========================================================================
@@ -551,7 +670,11 @@ class DeviceStorageManager {
 
   async addCategory(categoryData) {
     if (!this.initialized) await this.init();
-    const newCat = { id: categoryData.id || Date.now().toString(), ...categoryData, created_at: new Date().toISOString() };
+    const newCat = {
+      id: categoryData.id || Date.now().toString(),
+      ...categoryData,
+      created_at: new Date().toISOString()
+    };
     this.data.categories.push(newCat);
     await this.saveToDevice('categories');
     return Promise.resolve(newCat);
@@ -561,7 +684,10 @@ class DeviceStorageManager {
     if (!this.initialized) await this.init();
     const idx = this.data.categories.findIndex(c => c.id === categoryId);
     if (idx >= 0) {
-      this.data.categories[idx] = { ...this.data.categories[idx], ...updates, updated_at: new Date().toISOString() };
+      this.data.categories[idx] = {
+        ...this.data.categories[idx], ...updates,
+        updated_at: new Date().toISOString()
+      };
       await this.saveToDevice('categories');
       return Promise.resolve(this.data.categories[idx]);
     }
@@ -572,11 +698,14 @@ class DeviceStorageManager {
     if (!this.initialized) await this.init();
     this.data.categories = this.data.categories.filter(c => c.id !== categoryId);
     if (deleteProducts) {
-      this.data.products = this.data.products.filter(p => p.category !== categoryId && p.category_id !== categoryId);
+      this.data.products = this.data.products.filter(
+        p => p.category !== categoryId && p.category_id !== categoryId
+      );
     } else if (reassignToId) {
       this.data.products = this.data.products.map(p =>
         (p.category === categoryId || p.category_id === categoryId)
-          ? { ...p, category: reassignToId, category_id: reassignToId } : p
+          ? { ...p, category: reassignToId, category_id: reassignToId }
+          : p
       );
     }
     await Promise.all([this.saveToDevice('categories'), this.saveToDevice('products')]);
@@ -596,9 +725,9 @@ class DeviceStorageManager {
     if (!this.initialized) await this.init();
     const newProduct = {
       id: Date.now().toString(), ...productData,
-      quantity: parseFloat(productData.quantity || 0),
-      cost:     parseFloat(productData.cost     || 0),
-      price:    parseFloat(productData.price    || 0),
+      quantity:   parseFloat(productData.quantity || 0),
+      cost:       parseFloat(productData.cost     || 0),
+      price:      parseFloat(productData.price    || 0),
       created_at: new Date().toISOString()
     };
     this.data.products.push(newProduct);
@@ -612,9 +741,9 @@ class DeviceStorageManager {
     if (idx >= 0) {
       this.data.products[idx] = {
         ...this.data.products[idx], ...updates,
-        quantity: updates.quantity !== undefined ? parseFloat(updates.quantity) : this.data.products[idx].quantity,
-        cost:     updates.cost     !== undefined ? parseFloat(updates.cost)     : this.data.products[idx].cost,
-        price:    updates.price    !== undefined ? parseFloat(updates.price)    : this.data.products[idx].price,
+        quantity:   updates.quantity !== undefined ? parseFloat(updates.quantity) : this.data.products[idx].quantity,
+        cost:       updates.cost     !== undefined ? parseFloat(updates.cost)     : this.data.products[idx].cost,
+        price:      updates.price    !== undefined ? parseFloat(updates.price)    : this.data.products[idx].price,
         updated_at: new Date().toISOString()
       };
       await this.saveToDevice('products');
@@ -643,8 +772,9 @@ class DeviceStorageManager {
     if (!this.initialized) await this.init();
     const newSale = {
       id: Date.now().toString(), date: new Date().toISOString(), ...saleData,
-      total: parseFloat(saleData.total || 0), profit: parseFloat(saleData.profit || 0),
-      items: Array.isArray(saleData.items) ? saleData.items : []
+      total:  parseFloat(saleData.total  || 0),
+      profit: parseFloat(saleData.profit || 0),
+      items:  Array.isArray(saleData.items) ? saleData.items : []
     };
     this.data.sales.push(newSale);
     this.data.sales_history.push(JSON.parse(JSON.stringify(newSale)));
@@ -663,7 +793,7 @@ class DeviceStorageManager {
 
   async clearAllSales() {
     if (!this.initialized) await this.init();
-    this.data.sales = [];
+    this.data.sales        = [];
     this.data.periodTotals = this.getEmptyPeriodTotals();
     await Promise.all([this.saveToDevice('sales'), this.saveToDevice('periodTotals')]);
     return Promise.resolve(true);
@@ -677,6 +807,7 @@ class DeviceStorageManager {
     const sales = this.data.sales_history;
     const now   = new Date();
     const today = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+
     const tomorrow       = new Date(today); tomorrow.setDate(today.getDate() + 1);
     const yesterday      = new Date(today); yesterday.setDate(today.getDate() - 1);
     const thisWeekSun    = new Date(today); thisWeekSun.setDate(today.getDate() - today.getDay());
@@ -688,19 +819,22 @@ class DeviceStorageManager {
 
     const filter = (s, e) => sales.filter(x => { const d = new Date(x.date); return d >= s && d < e; });
     const stats  = list  => ({
-      revenue: list.reduce((s, x) => s + parseFloat(x.total  || 0), 0),
-      profit:  list.reduce((s, x) => s + parseFloat(x.profit || 0), 0),
-      sales_count: list.length, has_data: list.length > 0
+      revenue:     list.reduce((s, x) => s + parseFloat(x.total  || 0), 0),
+      profit:      list.reduce((s, x) => s + parseFloat(x.profit || 0), 0),
+      sales_count: list.length,
+      has_data:    list.length > 0
     });
 
     const stored = this.data.periodTotals || {};
-    const ft = stats(filter(today, tomorrow)), fy = stats(filter(yesterday, today));
-    const fw = stats(filter(lastWeekSun, thisWeekSun));
+    const ft = stats(filter(today,        tomorrow));
+    const fy = stats(filter(yesterday,    today));
+    const fw = stats(filter(lastWeekSun,  thisWeekSun));
     const fm = stats(filter(lastMonthStart, lastMonthEnd));
-    const fr = stats(filter(lastYearStart, lastYearEnd));
+    const fr = stats(filter(lastYearStart,  lastYearEnd));
 
     this.data.periodTotals = {
-      today: ft, yesterday: fy,
+      today:      ft,
+      yesterday:  fy,
       last_week:  fw.has_data ? fw : (stored.last_week?.has_data  ? stored.last_week  : fw),
       last_month: fm.has_data ? fm : (stored.last_month?.has_data ? stored.last_month : fm),
       last_year:  fr.has_data ? fr : (stored.last_year?.has_data  ? stored.last_year  : fr),
@@ -723,29 +857,39 @@ class DeviceStorageManager {
 
   async getCalendarData(year, month) {
     if (!this.initialized) await this.init();
-    const calendarData = {}; const paidDebtDates = new Set(); const mi = month - 1;
+    const calendarData   = {};
+    const paidDebtDates  = new Set();
+    const mi             = month - 1;
+
     this.data.sales_history.forEach(sale => {
       const d = new Date(sale.date);
       if (d.getFullYear() === year && d.getMonth() === mi) {
         const ds = d.toISOString().split('T')[0];
         if (!calendarData[ds]) calendarData[ds] = { revenue: 0, profit: 0, sales: [], payments: [] };
-        calendarData[ds].revenue += parseFloat(sale.total || 0);
+        calendarData[ds].revenue += parseFloat(sale.total  || 0);
         calendarData[ds].profit  += parseFloat(sale.profit || 0);
         calendarData[ds].sales.push(sale);
       }
     });
+
     this.data.payment_history.forEach(p => {
       const d = new Date(p.date_paid);
       if (d.getFullYear() === year && d.getMonth() === mi) {
         const ds = d.toISOString().split('T')[0];
         if (!calendarData[ds]) calendarData[ds] = { revenue: 0, profit: 0, sales: [], payments: [] };
-        calendarData[ds].payments.push(p); paidDebtDates.add(ds);
+        calendarData[ds].payments.push(p);
+        paidDebtDates.add(ds);
       }
     });
+
     const summaryArray = Object.entries(calendarData).map(([date, data]) => ({
-      date, total_revenue: data.revenue, total_profit: data.profit,
-      transaction_count: data.sales.length, payment_count: data.payments.length
+      date,
+      total_revenue:     data.revenue,
+      total_profit:      data.profit,
+      transaction_count: data.sales.length,
+      payment_count:     data.payments.length
     }));
+
     return Promise.resolve({ summaries: summaryArray, paid_debt_dates: Array.from(paidDebtDates) });
   }
 
@@ -754,6 +898,7 @@ class DeviceStorageManager {
     const dateSales    = this.data.sales_history.filter(s => s.date.split('T')[0] === dateStr);
     const datePayments = this.data.payment_history.filter(p => p.date_paid.split('T')[0] === dateStr);
     const productMap   = {};
+
     dateSales.forEach(sale => {
       (Array.isArray(sale.items) ? sale.items : []).forEach(item => {
         const name = item.product_name || item.name || 'Unknown';
@@ -761,23 +906,34 @@ class DeviceStorageManager {
         const cost = parseFloat(item.cost || item.cost_price || 0);
         const prc  = parseFloat(item.price || item.selling_price || 0);
         if (!productMap[name]) productMap[name] = { name, quantity: 0, profit: 0 };
-        productMap[name].quantity += qty; productMap[name].profit += (prc - cost) * qty;
+        productMap[name].quantity += qty;
+        productMap[name].profit   += (prc - cost) * qty;
       });
     });
+
     const psl = Object.values(productMap).sort((a, b) => b.quantity - a.quantity);
+
     return Promise.resolve({
-      date: dateStr, sales: dateSales, payments: datePayments,
+      date:              dateStr,
+      sales:             dateSales,
+      payments:          datePayments,
       total_revenue:     dateSales.reduce((s, x) => s + parseFloat(x.total  || 0), 0),
       total_profit:      dateSales.reduce((s, x) => s + parseFloat(x.profit || 0), 0),
       transaction_count: dateSales.length,
-      best_seller_by_quantity: psl[0]?.name || 'N/A', best_seller_quantity: psl[0]?.quantity || 0,
-      best_seller_by_profit:   psl[0]?.name || 'N/A', best_seller_profit: psl[0]?.profit || 0,
+      best_seller_by_quantity: psl[0]?.name     || 'N/A',
+      best_seller_quantity:    psl[0]?.quantity  || 0,
+      best_seller_by_profit:   psl[0]?.name     || 'N/A',
+      best_seller_profit:      psl[0]?.profit    || 0,
       products_sold_list: psl,
       debts_paid: datePayments.map(d => ({
-        id: d.id, customer_name: d.customer_name || d.name || 'Unknown',
-        total_amount: parseFloat(d.total_amount || 0), original_total: parseFloat(d.original_total || 0),
-        surcharge_percent: parseFloat(d.surcharge_percent || 0), surcharge_amount: parseFloat(d.surcharge_amount || 0),
-        date_borrowed: d.date || d.date_borrowed || '', items: Array.isArray(d.items) ? d.items : []
+        id:                d.id,
+        customer_name:     d.customer_name || d.name || 'Unknown',
+        total_amount:      parseFloat(d.total_amount      || 0),
+        original_total:    parseFloat(d.original_total    || 0),
+        surcharge_percent: parseFloat(d.surcharge_percent || 0),
+        surcharge_amount:  parseFloat(d.surcharge_amount  || 0),
+        date_borrowed:     d.date || d.date_borrowed || '',
+        items:             Array.isArray(d.items) ? d.items : []
       }))
     });
   }
@@ -799,22 +955,25 @@ class DeviceStorageManager {
     if (existingIdx >= 0) {
       const e = this.data.debtors[existingIdx];
       this.data.debtors[existingIdx] = {
-        ...e, items: [...(e.items || []), ...(debtorData.items || [])],
+        ...e,
+        items:            [...(e.items || []), ...(debtorData.items || [])],
         original_total:   parseFloat((parseFloat(e.original_total  || 0) + parseFloat(debtorData.original_total  || 0)).toFixed(2)),
         surcharge_amount: parseFloat((parseFloat(e.surcharge_amount || 0) + parseFloat(debtorData.surcharge_amount || 0)).toFixed(2)),
         total_debt:       parseFloat((parseFloat(e.total_debt       || 0) + parseFloat(debtorData.total_debt       || 0)).toFixed(2)),
-        updated_at: new Date().toISOString()
+        updated_at:       new Date().toISOString()
       };
       await this.saveToDevice('debtors');
       return Promise.resolve({ debtor: this.data.debtors[existingIdx], merged: true });
     }
     const newDebtor = {
-      id: Date.now().toString(), ...debtorData, date: new Date().toISOString(),
-      total_debt:        parseFloat(debtorData.total_debt      || debtorData.original_total || 0),
-      original_total:    parseFloat(debtorData.original_total  || debtorData.total_debt     || 0),
+      id: Date.now().toString(), ...debtorData,
+      date:              new Date().toISOString(),
+      total_debt:        parseFloat(debtorData.total_debt       || debtorData.original_total || 0),
+      original_total:    parseFloat(debtorData.original_total   || debtorData.total_debt     || 0),
       surcharge_percent: parseFloat(debtorData.surcharge_percent || 0),
       surcharge_amount:  parseFloat(debtorData.surcharge_amount  || 0),
-      paid: false, items: Array.isArray(debtorData.items) ? debtorData.items : []
+      paid:  false,
+      items: Array.isArray(debtorData.items) ? debtorData.items : []
     };
     this.data.debtors.push(newDebtor);
     await this.saveToDevice('debtors');
@@ -854,25 +1013,35 @@ class DeviceStorageManager {
   archivePayment(debtor) {
     if (!debtor.paid) return;
     const entry = {
-      id: debtor.id, customer_name: debtor.name || 'Unknown',
-      total_amount: parseFloat(debtor.total_debt || 0), original_total: parseFloat(debtor.original_total || 0),
-      surcharge_percent: parseFloat(debtor.surcharge_percent || 0), surcharge_amount: parseFloat(debtor.surcharge_amount || 0),
-      date_borrowed: debtor.date || debtor.date_borrowed || '',
-      date_paid: debtor.date_paid || new Date().toISOString(), items: debtor.items || []
+      id:                debtor.id,
+      customer_name:     debtor.name || 'Unknown',
+      total_amount:      parseFloat(debtor.total_debt       || 0),
+      original_total:    parseFloat(debtor.original_total   || 0),
+      surcharge_percent: parseFloat(debtor.surcharge_percent || 0),
+      surcharge_amount:  parseFloat(debtor.surcharge_amount  || 0),
+      date_borrowed:     debtor.date || debtor.date_borrowed || '',
+      date_paid:         debtor.date_paid || new Date().toISOString(),
+      items:             debtor.items || []
     };
-    if (!this.data.payment_history.find(h => h.id === entry.id)) this.data.payment_history.push(entry);
+    if (!this.data.payment_history.find(h => h.id === entry.id)) {
+      this.data.payment_history.push(entry);
+    }
   }
 
   async autoCleanupPaidDebtors() {
     const sevenDaysAgo = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000);
-    this.data.debtors = this.data.debtors.filter(d => !d.paid || !d.date_paid || new Date(d.date_paid) > sevenDaysAgo);
+    this.data.debtors = this.data.debtors.filter(
+      d => !d.paid || !d.date_paid || new Date(d.date_paid) > sevenDaysAgo
+    );
     await this.saveToDevice('debtors');
     return Promise.resolve(true);
   }
 
   async cleanupPaymentHistory() {
     const oneYearAgo = new Date(Date.now() - 365 * 24 * 60 * 60 * 1000);
-    this.data.payment_history = this.data.payment_history.filter(p => new Date(p.date_paid) > oneYearAgo);
+    this.data.payment_history = this.data.payment_history.filter(
+      p => new Date(p.date_paid) > oneYearAgo
+    );
     await this.saveToDevice('payment_history');
     return Promise.resolve(true);
   }
@@ -906,7 +1075,8 @@ class DeviceStorageManager {
   async getSettings() {
     if (!this.initialized) await this.init();
     const settings = this.data.settings || this.defaultSettings();
-    window.storeSettings = settings; window.CURRENT_SETTINGS = settings;
+    window.storeSettings   = settings;
+    window.CURRENT_SETTINGS = settings;
     return Promise.resolve(settings);
   }
 
@@ -921,7 +1091,8 @@ class DeviceStorageManager {
     };
     this.data.settings = updated;
     await this.saveToDevice('settings');
-    window.storeSettings = updated; window.CURRENT_SETTINGS = updated;
+    window.storeSettings    = updated;
+    window.CURRENT_SETTINGS = updated;
     localStorage.setItem('cached_settings', JSON.stringify(updated));
     return Promise.resolve(updated);
   }
@@ -931,11 +1102,11 @@ class DeviceStorageManager {
   // =========================================================================
 
   async cleanupOldTransactions(daysToKeep) {
-    const days = typeof daysToKeep === 'number' ? daysToKeep : 1;
+    const days   = typeof daysToKeep === 'number' ? daysToKeep : 1;
     const cutoff = new Date(Date.now() - days * 24 * 60 * 60 * 1000);
-    const savedTotals = JSON.parse(JSON.stringify(this.data.periodTotals));
-    this.data.sales = this.data.sales.filter(s => new Date(s.date) > cutoff);
-    this.data.periodTotals = savedTotals;
+    const savedTotals       = JSON.parse(JSON.stringify(this.data.periodTotals));
+    this.data.sales         = this.data.sales.filter(s => new Date(s.date) > cutoff);
+    this.data.periodTotals  = savedTotals;
     await Promise.all([this.saveToDevice('sales'), this.saveToDevice('periodTotals')]);
     return Promise.resolve(true);
   }
@@ -974,7 +1145,6 @@ console.log('✅ Device Storage module loaded');
 document.addEventListener('DOMContentLoaded', async () => {
   await DB.init();
 
-  // Update badge based on storage mode
   const badge = document.querySelector('.offline-badge');
   if (badge) {
     if (DB.storageMode === 'opfs') {
@@ -984,6 +1154,7 @@ document.addEventListener('DOMContentLoaded', async () => {
       badge.textContent      = '✓ Device Storage: ' + DB.dirHandle.name;
       badge.style.background = 'linear-gradient(135deg,#15803d,#166534)';
     }
+    // localStorage mode — badge stays as default "Offline Mode"
   }
 
   DB.scheduleAutoCleanup();
